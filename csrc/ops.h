@@ -114,6 +114,13 @@ void reshape_and_cache_flash(
     torch::Tensor& k_scale,
     torch::Tensor& v_scale);
 
+void copy_cache_flash(
+    torch::Tensor& key_cache_src,
+    torch::Tensor& value_cache_src,
+    torch::Tensor& key_cache_dst,
+    torch::Tensor& value_cache_dst,
+    torch::Tensor& block_indices);
+
 void concat_and_cache_mla(
     torch::Tensor& kv_c,
     torch::Tensor& k_pe,

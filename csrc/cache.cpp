@@ -195,6 +195,81 @@ class reshape_and_cache_flash_kernel {
   const float* v_scale_;
 };
 
+template <typename scalar_t, typename index_t>
+class copy_cache_flash_kernel {
+ public:
+  copy_cache_flash_kernel(
+      const scalar_t* __restrict__ key_cache_src,
+      const scalar_t* __restrict__ value_cache_src,
+      scalar_t* __restrict__ key_cache_dst,
+      scalar_t* __restrict__ value_cache_dst,
+      const index_t* __restrict__ block_indices,
+      const int64_t block_stride,
+      const int64_t page_stride,
+      const int64_t head_stride,
+      const int num_heads,
+      const int head_size,
+      const int block_size)
+      : key_cache_src_(key_cache_src),
+        value_cache_src_(value_cache_src),
+        key_cache_dst_(key_cache_dst),
+        value_cache_dst_(value_cache_dst),
+        block_indices_(block_indices),
+        block_stride_(block_stride),
+        page_stride_(page_stride),
+        head_stride_(head_stride),
+        num_heads_(num_heads),
+        head_size_(head_size),
+        block_size_(block_size) {}
+
+  void operator()(const sycl::nd_item<1>& item) const {
+    int64_t group_idx = item.get_group(0);
+    int64_t local_idx = item.get_local_id(0);
+    int local_range = item.get_local_range(0);
+
+    const int64_t block_idx = block_indices_[group_idx / block_size_];
+    const int64_t block_offset = group_idx % block_size_;
+    const int n = num_heads_ * head_size_;
+
+    // pointers to the beginning of the source row for this token.
+    const scalar_t* __restrict__ key_src = key_cache_src_ + block_idx * block_stride_ + block_offset * page_stride_;
+    const scalar_t* __restrict__ value_src = value_cache_src_ + block_idx * block_stride_ + block_offset * page_stride_;
+
+    // find the start position inside the kv-cache for this token.
+    scalar_t* __restrict__ key_dst =
+        key_cache_dst_ + block_idx * block_stride_ + block_offset * page_stride_;
+    scalar_t* __restrict__ value_dst =
+        value_cache_dst_ + block_idx * block_stride_ + block_offset * page_stride_;
+
+    constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
+
+    // Simple identity copy operation (no quantization)
+    auto copy_op = [](scalar_t& dst, const scalar_t& src) { dst = src; };
+    
+    vectorize_with_alignment<VEC_SIZE>(
+        key_src, key_dst, n, local_idx, local_range, copy_op);
+    vectorize_with_alignment<VEC_SIZE>(
+        value_src, value_dst, n, local_idx, local_range, copy_op);
+  }
+
+ private:
+  const scalar_t* __restrict__ key_cache_src_;    // [num_blocks, block_size, num_heads, 
+                                                  // head_size]
+  const scalar_t* __restrict__ value_cache_src_;  // [num_blocks, block_size, num_heads, 
+                                                  // head_size]
+  scalar_t* __restrict__ key_cache_dst_;          // [num_blocks, block_size, num_heads,
+                                                  // head_size]
+  scalar_t* __restrict__ value_cache_dst_;        // [num_blocks, block_size, num_heads,
+                                                  // head_size]
+  const index_t* __restrict__ block_indices_;
+  const int64_t block_stride_;
+  const int64_t page_stride_;
+  const int64_t head_stride_;
+  const int num_heads_;
+  const int head_size_;
+  const int block_size_;
+};
+
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 class concat_and_cache_mla_kernel {
  public:
@@ -816,6 +891,99 @@ void reshape_and_cache_flash(
 
   DISPATCH_BY_KV_CACHE_DTYPE(
       key.scalar_type(), kv_cache_dtype, CALL_RESHAPE_AND_CACHE_FLASH);
+}
+
+// Dispatch macro for copy_cache operations with cache dtype + index type
+// FN should be a macro that takes (CACHE_T, INDEX_T)
+#define DISPATCH_COPY_CACHE_FLASH(CACHE_DTYPE, INDEX_DTYPE, FN)             \
+  if (INDEX_DTYPE == at::kLong) {                                           \
+    if (CACHE_DTYPE == at::ScalarType::Float) {                             \
+      FN(float, int64_t);                                                   \
+    } else if (CACHE_DTYPE == at::ScalarType::Half) {                       \
+      FN(at::Half, int64_t);                                                \
+    } else if (CACHE_DTYPE == at::ScalarType::BFloat16) {                   \
+      FN(at::BFloat16, int64_t);                                            \
+    } else if (CACHE_DTYPE == at::ScalarType::Byte) {                       \
+      FN(uint8_t, int64_t);                                                 \
+    } else {                                                                \
+      TORCH_CHECK(false, "Unsupported cache type: ", CACHE_DTYPE);          \
+    }                                                                       \
+  } else if (INDEX_DTYPE == at::kInt) {                                     \
+    if (CACHE_DTYPE == at::ScalarType::Float) {                             \
+      FN(float, int32_t);                                                   \
+    } else if (CACHE_DTYPE == at::ScalarType::Half) {                       \
+      FN(at::Half, int32_t);                                                \
+    } else if (CACHE_DTYPE == at::ScalarType::BFloat16) {                   \
+      FN(at::BFloat16, int32_t);                                            \
+    } else if (CACHE_DTYPE == at::ScalarType::Byte) {                       \
+      FN(uint8_t, int32_t);                                                 \
+    } else {                                                                \
+      TORCH_CHECK(false, "Unsupported cache type: ", CACHE_DTYPE);          \
+    }                                                                       \
+  } else {                                                                  \
+    TORCH_CHECK(false, "Unsupported index dtype: ", INDEX_DTYPE,            \
+                " (must be int32 or int64)");                               \
+  }
+
+// CACHE_T is the data type of kv-cache.
+// INDEX_T is the data type of block indices.
+#define CALL_COPY_CACHE_FLASH(CACHE_T, INDEX_T)                        \
+  queue.submit([&](sycl::handler& cgh) {                               \
+    cgh.parallel_for(                                                  \
+        sycl::nd_range<1>(grid * block, block),                        \
+        vllm::copy_cache_flash_kernel<CACHE_T, INDEX_T>(               \
+            reinterpret_cast<CACHE_T*>(key_cache_src.data_ptr()),      \
+            reinterpret_cast<CACHE_T*>(value_cache_src.data_ptr()),    \
+            reinterpret_cast<CACHE_T*>(key_cache_dst.data_ptr()),      \
+            reinterpret_cast<CACHE_T*>(value_cache_dst.data_ptr()),    \
+            block_indices.data_ptr<INDEX_T>(),                         \
+            block_stride,                                              \
+            page_stride,                                               \
+            head_stride,                                               \
+            num_heads,                                                 \
+            head_size,                                                 \
+            block_size));                                              \
+  });
+
+void copy_cache_flash(
+    torch::Tensor& key_cache_src,
+    torch::Tensor& value_cache_src,
+    torch::Tensor& key_cache_dst,
+    torch::Tensor& value_cache_dst,
+    torch::Tensor& block_indices) {
+
+  // Accept both int32 and int64
+  TORCH_CHECK(
+      block_indices.scalar_type() == torch::kInt32 || block_indices.scalar_type() == torch::kInt64,
+      "block_indices must be int32 or int64");
+
+  int num_heads = key_cache_dst.size(2);
+  int head_size = key_cache_dst.size(3);
+  int block_size = key_cache_dst.size(1);
+
+  TORCH_CHECK(key_cache_src.size(2) == num_heads);
+  TORCH_CHECK(key_cache_src.size(3) == head_size);
+  TORCH_CHECK(key_cache_src.size(1) == block_size);
+  TORCH_CHECK(key_cache_src.scalar_type() == key_cache_dst.scalar_type(),
+              "Source and destination key caches must have the same dtype");
+  // Assume value cache has the same shape as key cache.
+
+  int num_tokens = block_indices.size(0) * block_size;
+
+  int64_t block_stride = key_cache_dst.stride(0);
+  int64_t page_stride = key_cache_dst.stride(1);
+  int64_t head_stride = key_cache_dst.stride(2);
+  TORCH_CHECK(key_cache_dst.stride(0) == value_cache_dst.stride(0));
+  TORCH_CHECK(key_cache_src.stride(0) == value_cache_src.stride(0));
+
+  sycl::range<1> grid(num_tokens);
+  sycl::range<1> block(std::min(num_heads * head_size, 1024));
+  // const at::DeviceGuard device_guard(key_cache_dst.device());
+  auto& queue = vllm::xpu::vllmGetQueue();
+
+  DISPATCH_COPY_CACHE_FLASH(
+      key_cache_src.scalar_type(), block_indices.scalar_type(), CALL_COPY_CACHE_FLASH);
+
 }
 
 // KV_T is the data type of key and value tensors.

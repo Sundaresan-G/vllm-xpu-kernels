@@ -233,6 +233,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl(
       "reshape_and_cache_flash", torch::kXPU, &reshape_and_cache_flash);
 
+  // Copy the key and value caches .
+  cache_ops.def(
+      "copy_cache_flash(Tensor key_cache_src, Tensor value_cache_src,"
+      "                 Tensor! key_cache_dst, Tensor! value_cache_dst,"
+      "                 Tensor block_indices) -> ()");
+  cache_ops.impl("copy_cache_flash", torch::kXPU, &copy_cache_flash);
+
   // Concat kv_c and k_pe and cache them.
   cache_ops.def(
       "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"
