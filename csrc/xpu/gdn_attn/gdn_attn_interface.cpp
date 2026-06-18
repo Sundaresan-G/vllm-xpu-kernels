@@ -8,6 +8,8 @@
 #include "gated_delta_rule.hpp"
 #ifdef VLLM_XPU_ENABLE_XE2
   #include "xe_2/chunk_causal_conv1d_xe2.hpp"
+  #include "xe_2/chunk_causal_conv1d_tiled_xe2.hpp"
+  #include "xe_2/l2norm.h"
   #include "xe_2/chunk_gated_delta_rule_xe2.h"
 #endif
 
@@ -430,29 +432,72 @@ void gdn_attention(
           {num_v_heads / tp_size, non_spec_token + padding_size},
           torch::dtype(torch::kFloat32).device(device).requires_grad(false));
 
-      gdn::chunk_causal_conv1d_xe2(
-          queue,
-          q,
-          k,
-          v,
-          z_active,
-          b,
-          a,
-          projected_states_qkvz_active,
-          projected_states_ba_active,
-          conv_weights,
-          conv_bias,
-          conv_state,
-          *non_spec_query_start_loc,
-          *non_spec_state_indices_tensor,
-          has_initial_state,
-          act_mode,
-          pad_slot_id,
-          num_prefills,
-          num_decodes,
-          reorder_input,
-          token_indx_ptr,
-          non_spec_token);
+      // Determine whether fused l2norm is valid for the chosen conv1d path.
+      // Tiled kernel: only valid when all Q+K features fit in a single
+      // feature chunk, i.e. 2 * head_k_dim <= feats_per_wg (256).
+      // Untiled kernel: always valid (entire QKV in one WG).
+      constexpr int tiled_feats_per_wg =
+          256;  // wg_size(64) * elems_per_item(4)
+      const bool use_tiled = (non_spec_token >= gdn::conv1d_tile_size);
+      const bool fuse_l2norm =
+          use_tiled ? (2 * head_k_dim <= tiled_feats_per_wg) : true;
+
+      if (use_tiled) {
+        gdn::chunk_causal_conv1d_tiled_xe2(
+            queue,
+            q,
+            k,
+            v,
+            z_active,
+            b,
+            a,
+            projected_states_qkvz_active,
+            projected_states_ba_active,
+            conv_weights,
+            conv_bias,
+            conv_state,
+            *non_spec_query_start_loc,
+            *non_spec_state_indices_tensor,
+            has_initial_state,
+            act_mode,
+            pad_slot_id,
+            num_prefills,
+            num_decodes,
+            reorder_input,
+            token_indx_ptr,
+            non_spec_token,
+            fuse_l2norm);
+      } else {
+        gdn::chunk_causal_conv1d_xe2(
+            queue,
+            q,
+            k,
+            v,
+            z_active,
+            b,
+            a,
+            projected_states_qkvz_active,
+            projected_states_ba_active,
+            conv_weights,
+            conv_bias,
+            conv_state,
+            *non_spec_query_start_loc,
+            *non_spec_state_indices_tensor,
+            has_initial_state,
+            act_mode,
+            pad_slot_id,
+            num_prefills,
+            num_decodes,
+            reorder_input,
+            token_indx_ptr,
+            non_spec_token,
+            fuse_l2norm);
+      }
+
+      // Run standalone l2norm kernel when not fused into conv1d
+      if (!fuse_l2norm) {
+        l2norm(queue, q, k);
+      }
 
       chunk_gated_delta_rule_xe2(
           queue,
