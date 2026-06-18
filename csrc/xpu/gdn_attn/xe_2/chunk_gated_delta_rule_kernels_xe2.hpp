@@ -931,6 +931,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     const int* query_start_loc,
     const int* cache_indices,
     const bool* has_initial_state,
+    const int* token_indx,
     const int batch_size,
     const int total_virtual_seqlen,
     const int num_k_heads,
@@ -1145,8 +1146,11 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       auto U_tensor_T = make_tensor(
           make_gmem_ptr(U_ptr),
           make_layout(U_tensor_T_shape, make_stride(_1{}, head_v_dim)));
-      auto O_ptr = core_attn_out + out_chunk_offset * num_v_heads * head_v_dim +
-                   v_head_id * head_v_dim;
+      auto O_ptr =
+          core_attn_out +
+          (token_indx ? token_indx[out_chunk_offset] : out_chunk_offset) *
+              num_v_heads * head_v_dim +
+          v_head_id * head_v_dim;
       auto O_tensor_shape = make_shape(current_chunk_size, head_v_dim);
       auto O_tensor = make_tensor(
           make_gmem_ptr(O_ptr),
@@ -1282,6 +1286,7 @@ void kernel_launcher(
     const int* query_start_loc,
     const int* cache_indices,
     const bool* has_initial_state,
+    const int* token_indx,
     const int batch_size,
     const int total_virtual_seqlen,
     const int num_k_heads,
@@ -1307,7 +1312,7 @@ void kernel_launcher(
   sycl::range<3> global_prepare(1, sm_count, 1);
   int slm_size_prepare = num_v_heads * 2 + chunk_size;
 
-  auto event_prepare = queue.submit([&](sycl::handler& cgh) {
+  queue.submit([&](sycl::handler& cgh) {
     cgh.parallel_for<ChunkPrepareKernel<T, StateT>>(
         sycl::nd_range<3>{global_prepare * local_prepare, local_prepare},
         kernel_props,
@@ -1327,7 +1332,6 @@ void kernel_launcher(
               head_v_dim);
         });
   });
-  EventManager::getInstance().addEvent(event_prepare);
 
   // compute A
   using WGTileComputeA = chunk_gemm_policy_compute_A::WGTile;
@@ -1343,7 +1347,7 @@ void kernel_launcher(
       1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroupComputeA, 1);
   int slm_size_compute_A = chunk_size;
 
-  auto event_compute_A = queue.submit([&](sycl::handler& cgh) {
+  queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_mem(
         sycl::range<1>(slm_size_compute_A), cgh);
     cgh.parallel_for<ChunkComputeAKernel<T, StateT>>(
@@ -1366,7 +1370,6 @@ void kernel_launcher(
               head_v_dim);
         });
   });
-  EventManager::getInstance().addEvent(event_compute_A);
 
   if (vllm::xpu::is_bmg()) {
     using WGTileInverse = chunk_gemm_policy_inverse::WGTile;
@@ -1386,7 +1389,7 @@ void kernel_launcher(
             num_v_heads * num_v_heads,
         1);
 
-    auto event_inverse = queue.submit([&](sycl::handler& cgh) {
+    queue.submit([&](sycl::handler& cgh) {
       cgh.parallel_for<ChunkInverseOptKernel<T, StateT>>(
           sycl::nd_range<3>{global_inverse * local_inverse, local_inverse},
           kernel_props,
@@ -1402,7 +1405,6 @@ void kernel_launcher(
                 head_v_dim);
           });
     });
-    EventManager::getInstance().addEvent(event_inverse);
   } else {
     // PVC has acc issue of sycl tla, so use native implementation for inverse
     // Once issue is fixed, remove this workaround and use the same MMA-based
@@ -1413,7 +1415,7 @@ void kernel_launcher(
         1, sm_count * MaxThreadsPerSM / inverse_items, 1);
     int slm_size_inverse = chunk_size * chunk_size * 2;
 
-    auto event_inverse = queue.submit([&](sycl::handler& cgh) {
+    queue.submit([&](sycl::handler& cgh) {
       sycl::local_accessor<float, 1> local_mem(
           sycl::range<1>(slm_size_inverse), cgh);
       cgh.parallel_for<ChunkInverseKernel<T, StateT>>(
@@ -1432,7 +1434,6 @@ void kernel_launcher(
                 head_v_dim);
           });
     });
-    EventManager::getInstance().addEvent(event_inverse);
   }
 
   // compute W U
@@ -1449,7 +1450,7 @@ void kernel_launcher(
       1, sm_count * MaxThreadsPerSM / MaxThreadsPerWorkgroupComputeWU, 1);
   int slm_size_compute_wu = num_v_heads * 2 + chunk_size * 2;
 
-  auto event_compute_wu = queue.submit([&](sycl::handler& cgh) {
+  queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_mem(
         sycl::range<1>(slm_size_compute_wu), cgh);
     cgh.parallel_for<ChunkComputeWUKernel<T, StateT>>(
@@ -1479,7 +1480,6 @@ void kernel_launcher(
               head_v_dim);
         });
   });
-  EventManager::getInstance().addEvent(event_compute_wu);
 
   // compute O
   using WGTileFwdO = chunk_gemm_policy_fwd_o::WGTile;
@@ -1494,7 +1494,7 @@ void kernel_launcher(
   sycl::range<3> global_fwd_o(batch_size, num_v_heads, 1);
   int slm_size_fwd_o = chunk_size + chunk_size + chunk_size;
 
-  auto event_fwd_o = queue.submit([&](sycl::handler& cgh) {
+  queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_mem(
         sycl::range<1>(slm_size_fwd_o), cgh);
     cgh.parallel_for<ChunkFwdOKernel<T, StateT>>(
@@ -1515,6 +1515,7 @@ void kernel_launcher(
               query_start_loc,
               cache_indices,
               has_initial_state,
+              token_indx,
               batch_size,
               total_virtual_seqlen,
               num_k_heads,
@@ -1523,7 +1524,6 @@ void kernel_launcher(
               head_v_dim);
         });
   });
-  EventManager::getInstance().addEvent(event_fwd_o);
 }
 
 void chunk_gated_delta_rule_impl_xe2(
@@ -1543,7 +1543,8 @@ void chunk_gated_delta_rule_impl_xe2(
     const std::optional<torch::Tensor>&
         has_initial_state,  // [batch_size] or None
     const int num_prefills,
-    const int num_decodes) {
+    const int num_decodes,
+    const int* token_indx) {
   if (num_prefills == 0 && num_decodes == 0) {
     return;
   }
@@ -1610,6 +1611,7 @@ void chunk_gated_delta_rule_impl_xe2(
       has_initial_state.has_value()                                \
           ? reinterpret_cast<bool*>(has_initial_state->data_ptr()) \
           : nullptr,                                               \
+      token_indx,                                                  \
       batch_size,                                                  \
       total_virtual_seqlen,                                        \
       num_k_heads,                                                 \

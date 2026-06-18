@@ -72,6 +72,20 @@ def rotary_embedding(
                                   cos_sin_cache, is_neox)
 
 
+def multimodal_rotary_embedding(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    mrope_section: list[int],
+) -> None:
+    torch.ops._xpu_C.multimodal_rotary_embedding(positions, query, key,
+                                                 head_size, cos_sin_cache,
+                                                 is_neox, mrope_section)
+
+
 def deepseek_scaling_rope(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -334,7 +348,8 @@ def int4_gemm_w4a8(input: torch.Tensor,
 def fp8_gemm(input: torch.Tensor, weight: torch.Tensor,
              out_dtype: Optional[torch.dtype],
              scale_act: Optional[torch.Tensor],
-             scale_wei: Optional[torch.Tensor], bias: Optional[torch.Tensor]):
+             scale_wei: Optional[torch.Tensor],
+             bias: Optional[torch.Tensor] = None):
     return torch.ops._xpu_C.fp8_gemm(input, weight, out_dtype, scale_act,
                                      scale_wei, bias)
 
@@ -345,7 +360,7 @@ def fp4_gemm(
     scale_act: torch.Tensor,
     scale_wei: torch.Tensor,
     out_dtype: Optional[torch.dtype],
-    bias: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor] = None,
 ):
     return torch.ops._xpu_C.fp4_gemm(input, weight, scale_act, scale_wei,
                                      out_dtype, bias)

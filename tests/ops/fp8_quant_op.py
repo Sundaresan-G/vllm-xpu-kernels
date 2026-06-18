@@ -10,6 +10,117 @@ import tests.register_ops as ops
 # Add parent directory to Python path
 # sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))) #noqa: E501
 
+FP8_E4M3_MAX = 448.0
+
+
+def fp8_block_quant_2d(
+    x: torch.Tensor,
+    block_m: int,
+    block_n: int,
+    fp8_dtype=torch.float8_e4m3fn,
+    eps: float = 1e-6,
+):
+    """
+    Reference FP8 2D block quantization
+
+    Args:
+        x: [M, N] float tensor (fp16/fp32)
+        block_m: block rows
+        block_n: block cols
+        fp8_dtype: torch.float8_e4m3fn
+    Returns:
+        q: FP8 tensor [M, N]
+        scales: FP32 tensor [ceil(M/BM), ceil(N/BN)]
+    """
+    assert x.dim() == 2
+    M, N = x.shape
+    device = x.device
+
+    assert (block_m <= M and block_n <= N and M % block_m == 0
+            and N % block_n == 0)
+    BM, BN = block_m, block_n
+    grid_m = (M + BM - 1) // BM
+    grid_n = (N + BN - 1) // BN
+
+    scales = torch.empty((grid_m, grid_n), device=device, dtype=torch.float32)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+
+    FP8_MAX = FP8_E4M3_MAX
+
+    for gm in range(grid_m):
+        for gn in range(grid_n):
+            m0 = gm * BM
+            n0 = gn * BN
+            m1 = min(m0 + BM, M)
+            n1 = min(n0 + BN, N)
+
+            block = x[m0:m1, n0:n1]
+
+            # absmax
+            amax = block.abs().max()
+            scale = amax / FP8_MAX
+            scale = torch.clamp(scale, min=eps)
+
+            scales[gm, gn] = scale
+
+            # quantize
+            q_block = (block / scale).to(fp8_dtype)
+            q[m0:m1, n0:n1] = q_block
+
+    return q, scales
+
+
+def fp8_block_dequant_2d(
+    q: torch.Tensor,
+    scales: torch.Tensor,
+    block_m: int,
+    block_n: int,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """
+    Dequantize a 2D block-quantized FP8 tensor.
+
+    Args:
+        q: FP8 tensor [M, N]
+        scales: FP32 tensor [ceil(M/BM), ceil(N/BN)]
+        block_m: block rows
+        block_n: block cols
+        dtype: output dtype (e.g. torch.float16, torch.bfloat16)
+    Returns:
+        Dequantized tensor [M, N] in the specified dtype
+    """
+    assert q.dim() == 2
+    M, N = q.shape
+    grid_m, grid_n = scales.shape
+
+    return (q.to(torch.float32).reshape(grid_m, block_m, grid_n, block_n) *
+            scales.reshape(grid_m, 1, grid_n, 1)).reshape(M, N).to(dtype)
+
+
+def per_token_group_dequant_fp8(
+    q: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """
+    Dequantize a per-token-group quantized FP8 tensor.
+
+    Args:
+        q: FP8 tensor [M, K]
+        scales: FP32 tensor [M, K//group_size]
+        group_size: number of elements per group
+        dtype: output dtype
+    Returns:
+        Dequantized tensor [M, K] in the specified dtype
+    """
+    assert q.dim() == 2
+    M, K = q.shape
+    num_groups = K // group_size
+
+    return (q.to(torch.float32).reshape(M, num_groups, group_size) *
+            scales.unsqueeze(-1)).reshape(M, K).to(dtype)
+
 
 def scaled_fp8_quant(
     input: torch.Tensor,
@@ -73,6 +184,15 @@ def scaled_fp8_quant(
     return output, scale
 
 
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def get_tma_aligned_size(x: int, element_size: int) -> int:
+    alignment = 16 // element_size
+    return _ceil_div(x, alignment) * alignment
+
+
 def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
@@ -80,6 +200,7 @@ def per_token_group_quant_fp8(
     dtype: torch.dtype = torch.float8_e4m3fn,
     out_q: torch.Tensor | None = None,
     column_major_scales: bool = False,
+    tma_aligned_scales: bool = False,
     use_ue8m0: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
@@ -93,6 +214,7 @@ def per_token_group_quant_fp8(
         is supported for now.
         out_q: Optional output tensor. If not provided, function will create.
         column_major_scales: Outputs scales in column major.
+        tma_aligned_scales: Outputs scales in TMA-aligned layout.
     Returns:
         tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the
         scaling factor.
@@ -113,16 +235,30 @@ def per_token_group_quant_fp8(
         x_q = torch.empty_like(x, device=x.device, dtype=dtype)
 
     if column_major_scales:
-        shape = (x.shape[-1] // group_size, ) + x.shape[:-1]
-        x_s = torch.empty(shape, device=x.device,
-                          dtype=torch.float32).permute(-1, -2)
+        if tma_aligned_scales:
+            m = x.shape[-2]
+            sf_k = x.shape[-1] // group_size
+            tma_aligned_m = get_tma_aligned_size(m, 4)
+            shape = x.shape[:-2] + (m, sf_k)
+            stride = ((1, tma_aligned_m) if x.dim() == 2 else
+                      (tma_aligned_m * sf_k, 1, tma_aligned_m))
+            x_s = torch.empty_strided(shape,
+                                      stride,
+                                      device=x.device,
+                                      dtype=torch.float32)
+        else:
+            shape = x.shape[:-2] + (x.shape[-1] // group_size, x.shape[-2])
+            x_s = torch.empty(shape, device=x.device,
+                              dtype=torch.float32).permute(-1, -2)
     else:
         shape = x.shape[:-1] + (x.shape[-1] // group_size, )
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
     # TODO(bnell): this causes some fp8 moe test to fail.
     torch.ops._C.per_token_group_fp8_quant(x, x_q, x_s, group_size, eps,
-                                           fp8_min, fp8_max, use_ue8m0)
+                                           fp8_min, fp8_max, use_ue8m0,
+                                           column_major_scales,
+                                           tma_aligned_scales)
 
     if use_ue8m0:
         x_s = x_s.to(torch.float8_e8m0fnu)

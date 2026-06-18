@@ -112,7 +112,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
       "int num_heads_k, int num_heads_v, int head_dim, float eps, "
       "Tensor q_weight, Tensor k_weight, Tensor cos_sin_cache, "
-      "bool is_neox, Tensor position_ids) -> ()");
+      "bool is_neox, Tensor position_ids, "
+      "int forced_token_heads_per_warp=-1) -> ()");
   ops.impl("fused_qk_norm_rope", torch::kXPU, &fused_qk_norm_rope);
 
   // Compute FP8 quantized tensor for given scaling factor.
@@ -143,7 +144,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "
       "output_s, "
       "int group_size, float eps, float fp8_min, float fp8_max, bool "
-      "scale_ue8m0) -> ()");
+      "scale_ue8m0, bool dummy_is_scale_transposed, bool dummy_is_tma_aligned "
+      ") -> ()");
   ops.impl(
       "per_token_group_fp8_quant", torch::kXPU, &per_token_group_quant_fp8);
 

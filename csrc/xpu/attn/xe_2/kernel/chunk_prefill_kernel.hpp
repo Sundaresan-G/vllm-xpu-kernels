@@ -65,7 +65,8 @@ template <
     class ProblemShape_,
     class CollectiveMainloop_,
     class CollectiveEpilogue_,
-    class TileScheduler_>
+    class TileScheduler_,
+    bool SoftmaxLSE_ = false>
 class XeFMHAFwdKernel {
  public:
   //
@@ -117,6 +118,7 @@ class XeFMHAFwdKernel {
   static constexpr bool CausalMask = CollectiveMainloop::CausalMask;
   static constexpr bool LocalMask = CollectiveMainloop::LocalMask;
   static constexpr bool Sink = CollectiveEpilogue::Sink;
+  static constexpr bool SoftmaxLSE = SoftmaxLSE_;
   using ElementSink = typename CollectiveEpilogue::ElementSink;
 
   // Kernel level shared memory storage
@@ -144,6 +146,13 @@ class XeFMHAFwdKernel {
 
     // softmax sink
     const ElementSink* ptr_S;
+
+    // softmax_lse output [total_seqlen_q, num_heads_q] (nullptr if disabled)
+    float* softmax_lse;
+    int lse_stride;  // = num_heads_q
+
+    // per-batch mask: true = prefill, false = decode; nullptr = process all
+    const bool* is_prefill;
   };
   using KernelParams = KernelArguments;
 
@@ -247,6 +256,10 @@ class XeFMHAFwdKernel {
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
       auto [blk_q, blk_v, head_q, idx_b] =
           tile_scheduler.get_block_coord();  // (Q,V,h,b)
+
+      // Skip decode batches when is_prefill mask is provided
+      if (p.is_prefill != nullptr && !p.is_prefill[idx_b]) continue;
+
       auto blk_qv = make_coord(blk_q, blk_v);
       int head = head_q / head_group_q;
 
@@ -269,16 +282,39 @@ class XeFMHAFwdKernel {
                     : cute::min(
                           seq_len_kv, full_tile_offset + seq_coord + q_sg_tile)
               : seq_len_kv;
-      const int k_block0 =
+      const int sg_k_block0 =
           LocalMask
               ? cute::max(
                     seq_coord + full_tile_offset - params.mainloop.local_left,
                     0) /
                     get<1>(TileShapeQK{})
               : 0;
-      const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
-      const int k_blocks_causal =
+      const int sg_k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+      const int sg_k_blocks_causal =
           CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{})
+                     : 0;
+
+      // The mainloop wraps each K iteration in a workgroup-scoped barrier
+      // pair, so every subgroup in the workgroup must execute the same
+      // K-loop trip count. Reduce the per-SG bounds across the WG:
+      //   k_block0        = min across WG (start no later than any SG)
+      //   k_blocks        = max across WG (end no earlier than any SG)
+      //   k_blocks_causal = min across WG (turn on causal masking no later
+      //                                    than any SG needs it)
+      // Per-element causal / local / remainder masking inside the mainloop
+      // handles the widened range safely for SGs that didn't need it.
+      auto wg = sycl::ext::oneapi::this_work_item::get_work_group<3>();
+      const int k_block0 =
+          LocalMask
+              ? sycl::reduce_over_group(wg, sg_k_block0, sycl::minimum<int>{})
+              : 0;
+      const int k_blocks =
+          (CausalMask || LocalMask)
+              ? sycl::reduce_over_group(wg, sg_k_blocks, sycl::maximum<int>{})
+              : sg_k_blocks;
+      const int k_blocks_causal =
+          CausalMask ? sycl::reduce_over_group(
+                           wg, sg_k_blocks_causal, sycl::minimum<int>{})
                      : 0;
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
@@ -343,6 +379,42 @@ class XeFMHAFwdKernel {
           thr_id,
           seq_len,
           full_tile_offset);
+
+      // return softmax_lse
+      if constexpr (SoftmaxLSE) {
+        static_assert(
+            size<3>(typename TiledMMAPV::ThrLayoutVMNK{}) == 1,
+            "softmax_lse requires ReduceK == 1 in TiledMMAPV");
+        if (get<1>(blk_qv) == 0 && (thr_id % intel::sg_size == 0)) {
+          using ElementA = typename FragA::value_type;
+          constexpr float kLn2 = 0.6931471805599453f;
+          int q_tile_start = blk_q * get<0>(TileShapeQK{});
+          int qo_cumul = 0;
+          if constexpr (is_var_len) {
+            qo_cumul = s.seq_len_qo.cumulative_length[idx_b];
+          }
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tA_sum.size(); i++) {
+            int q_in_batch = q_tile_start + q_offset_sg + i;
+            if (q_in_batch < seq_len_qo) {
+              ElementA sum_val = tA_sum(i);
+              // Include sink contribution for LSE computation
+              if constexpr (Sink) {
+                constexpr double kLog2e = 1.4426950408889634074;
+                ElementSink s_head = p.ptr_S[head_q];
+                sum_val += sycl::native::exp2(
+                    static_cast<ElementA>(s_head * kLog2e) - tA_max(i));
+              }
+              float lse = static_cast<float>(tA_max(i)) * kLn2 +
+                          sycl::log(static_cast<float>(sum_val));
+              int global_q = qo_cumul + q_in_batch;
+              p.softmax_lse[global_q * p.lse_stride + head_q] = lse;
+            }
+          }
+        }
+      }
+
       if constexpr (
           !is_empty_v<MainloopSharedStorage> &&
           !is_empty_v<EpilogueSharedStorage>) {

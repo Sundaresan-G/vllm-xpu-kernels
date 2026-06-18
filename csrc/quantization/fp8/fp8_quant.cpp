@@ -250,17 +250,17 @@ class per_token_group_quant_8bit_kernel {
 
     const float inverted_scale = 1.0f / (y_s);
     constexpr int VEC_SIZE = 4;
-    if (!can_vectorize) {
+    if (can_vectorize) {
       fp8::ConvertWithScaleOp<true, fp8_type> op{inverted_scale};
       vectorize_with_alignment<VEC_SIZE>(
           group_input,
           group_output,
           group_size,
           lane_id,
-          item.get_local_range(0),
+          threads_per_group,
           op);
     } else {
-      for (int i = lane_id; i < group_size; i += groups_per_block) {
+      for (int i = lane_id; i < group_size; i += threads_per_group) {
         fp8::ConvertWithScaleOp<true, fp8_type> op{inverted_scale};
         op(group_output[i], group_input[i]);
       }
@@ -608,7 +608,9 @@ void per_token_group_quant_fp8(
     double eps,
     double fp8_min,
     double fp8_max,
-    bool scale_ue8m0) {
+    bool scale_ue8m0,
+    bool dummy_is_scale_transposed,
+    bool dummy_is_tma_aligned) {
   TORCH_CHECK(input.is_contiguous());
   TORCH_CHECK(output_q.is_contiguous());
 

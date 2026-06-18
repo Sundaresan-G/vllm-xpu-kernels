@@ -59,7 +59,7 @@ torch::Tensor cutlass_grouped_gemm_interface(
     const c10::optional<at::Tensor>& ptr_scales,
     const c10::optional<at::Tensor>& ptr_bias,
     torch::Tensor ptr_D,
-    torch::Tensor expert_first_token_offset,
+    torch::Tensor rows_per_expert,
     int64_t N,
     int64_t K,
     int64_t num_experts,
@@ -75,6 +75,15 @@ std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(
     const at::Tensor& cos_sin_cache,
     int64_t rotary_dim,
     bool is_neox);
+
+void multimodal_rotary_embedding(
+    torch::Tensor& positions,  // [num_mrope_sections, num_tokens]
+    torch::Tensor& query,
+    std::optional<torch::Tensor> key,
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,  // [max_position, rot_dim]
+    bool is_neox,
+    std::vector<int64_t> mrope_section);  // host int list [num_mrope_sections]
 
 #ifdef VLLM_GDN_ENABLED
 void gdn_attention(
@@ -95,9 +104,15 @@ void gdn_attention(
     const torch::Tensor& dt_bias,
     const int64_t num_prefills,
     const int64_t num_decodes,
+    const int64_t num_spec_decodes,
     const std::optional<torch::Tensor>& has_initial_state,
-    const torch::Tensor& non_spec_query_start_loc,
-    const torch::Tensor& non_spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& non_spec_query_start_loc,
+    const std::optional<torch::Tensor>& non_spec_token_indx,
+    const std::optional<torch::Tensor>& non_spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& spec_query_start_loc,
+    const std::optional<torch::Tensor>& spec_token_indx,
+    const std::optional<torch::Tensor>& spec_state_indices_tensor,
+    const std::optional<torch::Tensor>& num_accepted_tokens,
     const int64_t num_actual_tokens,
     const int64_t tp_size,
     const bool reorder_input);
@@ -121,3 +136,22 @@ void topk_topp_sampler(
     const std::string& logprobs_mode,
     torch::Tensor& seeds,  // should on CPU
     const double lambda);
+
+#ifdef VLLM_MQA_LOGITS_ENABLED
+torch::Tensor fp8_mqa_logits(
+    const torch::Tensor& q,
+    const torch::Tensor& kv,
+    const torch::Tensor& kv_scales,
+    const torch::Tensor& weights,
+    const torch::Tensor& cu_seqlen_ks,
+    const torch::Tensor& cu_seqlen_ke);
+
+torch::Tensor fp8_paged_mqa_logits(
+    const torch::Tensor& q_fp8,
+    const torch::Tensor& kv_cache_fp8,
+    const torch::Tensor& weights,
+    const torch::Tensor& context_lens,
+    const torch::Tensor& block_tables,
+    const c10::optional<at::Tensor>& schedule_metadata,
+    int64_t max_model_len);
+#endif
